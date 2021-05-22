@@ -59,7 +59,7 @@ and how to submit a taskflow to an executor.
 class Taskflow : public FlowBuilder {
 
   friend class Topology;
-  friend class Executor;
+  friend class TaskScheduler;
   friend class FlowBuilder;
 
   struct Dumper {
