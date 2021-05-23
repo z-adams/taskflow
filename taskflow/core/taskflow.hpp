@@ -403,7 +403,7 @@ fu.get();
 template <typename T>
 class Future : public std::future<T>  {
 
-  friend class Executor;
+  friend class TaskScheduler;
   friend class Subflow;
   
   using handle_t = std::variant<

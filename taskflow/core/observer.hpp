@@ -230,7 +230,7 @@ observer->dump(std::cout);
 */
 class ChromeObserver : public ObserverInterface {
 
-  friend class Executor;
+  friend class TaskScheduler;
   
   // data structure to record each task execution
   struct Segment {
