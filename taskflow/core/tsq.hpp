@@ -40,6 +40,12 @@ class TaskQueue {
       S {new std::atomic<T>[static_cast<size_t>(C)]} {
     }
 
+    Array(Array&& move) noexcept :
+      C(std::exchange(move.C, 0)),
+      M(std::exchange(move.M, 0)),
+      S(std::exchange(move.S, nullptr))
+    {}
+
     ~Array() {
       delete [] S;
     }
@@ -80,6 +86,11 @@ class TaskQueue {
     @param capacity the capacity of the queue (must be power of 2)
     */
     explicit TaskQueue(int64_t capacity = 1024);
+
+    /**
+    @brief move constructor
+    */
+    //TaskQueue(TaskQueue<T>&& move) noexcept;
 
     /**
     @brief destructs the queue
@@ -140,6 +151,17 @@ TaskQueue<T>::TaskQueue(int64_t c) {
   _array.store(new Array{c}, std::memory_order_relaxed);
   _garbage.reserve(32);
 }
+
+// Move Constructor
+//template <typename T>
+//TaskQueue<T>::TaskQueue(TaskQueue<T>&& move) noexcept :
+//  _top(move._top.load()),
+//  _bottom(move._bottom.load()),
+//  _array(move._array.load()),
+//  _garbage(std::move(move._garbage)),
+//{
+//  move._array.store(nullptr);
+//}
 
 // Destructor
 template <typename T>

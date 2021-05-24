@@ -19,8 +19,8 @@ namespace tf {
 
 @brief execution interface for running a taskflow graph
 
-An task scheduler object manages a set of worker threads to run taskflow(s)
-using an efficient work-stealing scheduling algorithm.
+Uses an efficient work-stealing scheduling algorithm to execute task
+flows.
 
 */
 class TaskScheduler {
@@ -28,17 +28,12 @@ class TaskScheduler {
   friend class FlowBuilder;
   friend class Subflow;
 
-  //struct PerThread {
-  //  Worker* worker;
-  //  inline PerThread() : worker {nullptr} { }
-  //};
-
   public:
 
     /**
     @brief constructs the task scheduler with N worker threads
     */
-    explicit TaskScheduler(size_t N);
+    explicit TaskScheduler();
     
     /**
     @brief destructs the task scheduler 
@@ -139,6 +134,15 @@ class TaskScheduler {
     int this_worker_id() const;
 
     /** 
+    @brief thread routine which executes tasks
+
+    @param w worker object representing the executing thread
+
+    This method is the main work loop executed by a taskflow worker.
+    */
+    void execute_tasks(Worker& w);
+
+    /** 
     @brief runs a given function asynchronously
 
     @tparam F callable type
@@ -187,14 +191,12 @@ class TaskScheduler {
     */
     size_t num_observers() const;
 
-  private:
+  protected:
 
     //inline static thread_local PerThread _per_thread;
     inline static thread_local Worker* _this_worker {nullptr};
 
-    const size_t _VICTIM_BEG;
-    const size_t _VICTIM_END;
-    const size_t _MAX_STEALS;
+    size_t _MAX_STEALS;
     const size_t _MAX_YIELDS;
    
     std::condition_variable _topology_cv;
@@ -203,8 +205,7 @@ class TaskScheduler {
 
     size_t _num_topologies {0};
     
-    std::vector<Worker> _workers;
-    std::vector<std::thread> _threads;
+    std::vector<std::shared_ptr<Worker>> _workers;
 
     Notifier _notifier;
 
@@ -220,7 +221,7 @@ class TaskScheduler {
     
     void _observer_prologue(Worker&, Node*);
     void _observer_epilogue(Worker&, Node*);
-    void _spawn(size_t);
+    std::shared_ptr<Worker> _register_worker(std::thread* thread);
     void _worker_loop(Worker&);
     void _exploit_task(Worker&, Node*&);
     void _explore_task(Worker&, Node*&);
@@ -257,19 +258,9 @@ class TaskScheduler {
 };
 
 // Constructor
-inline TaskScheduler::TaskScheduler(size_t N) : 
-  _VICTIM_BEG {0},
-  _VICTIM_END {N - 1},
-  _MAX_STEALS {(N + 1) << 1},
+inline TaskScheduler::TaskScheduler() : 
   _MAX_YIELDS {100},
-  _workers    {N},
-  _notifier   {N} {
-  
-  if(N == 0) {
-    TF_THROW("no cpu workers to execute taskflows");
-  }
-  
-  _spawn(N);
+  _notifier   {0} {
 
   // instantite the default observer if requested
   if(has_env(TF_ENABLE_PROFILER)) {
@@ -287,13 +278,10 @@ inline TaskScheduler::~TaskScheduler() {
   _done = true;
 
   _notifier.notify(true);
-  
-  for(auto& t : _threads){
-    t.join();
-  } 
-  
-  // flush the default observer
-  //_flush_tfprof();
+
+  for (auto w : _workers) {
+      w->_thread->join();
+  }
 }
 
 // Function: num_workers
@@ -305,7 +293,27 @@ inline size_t TaskScheduler::num_workers() const {
 inline size_t TaskScheduler::num_topologies() const {
   return _num_topologies;
 }
-    
+
+// Function: execute_tasks
+inline void TaskScheduler::execute_tasks(Worker& w)
+{
+  _this_worker = &w;
+
+  Node* t = nullptr;
+
+  // must use 1 as condition instead of !done (why?)
+  while(1) {
+        
+    // execute the tasks.
+    _exploit_task(w, t);
+
+    // wait for tasks
+    if(_wait_for_task(w, t) == false) {
+      break;
+    }
+  }
+}
+
 // Function: async
 template <typename F, typename... ArgsT>
 auto TaskScheduler::async(F&& f, ArgsT&&... args) {
@@ -361,74 +369,41 @@ void TaskScheduler::silent_async(F&& f, ArgsT&&... args) {
 
 // Function: this_worker_id
 inline int TaskScheduler::this_worker_id() const {
-  //auto worker = _per_thread.worker;
+
   Worker* worker = _this_worker;
   return worker ? static_cast<int>(worker->_id) : -1;
 }
 
-// Procedure: _spawn
-inline void TaskScheduler::_spawn(size_t N) {
-  for(size_t id=0; id<N; ++id) {
+// Procedure: _register_worker
+inline std::shared_ptr<Worker> TaskScheduler::_register_worker(std::thread* thread) {
 
-    _workers[id]._id = id;
-    _workers[id]._vtm = id;
-    _workers[id]._scheduler = this;
-    _workers[id]._waiter = &_notifier._waiters[id];
-    
-    _threads.emplace_back([this] (Worker& w) -> void {
-
-      //_per_thread.worker = &w;
-      _this_worker = &w;
-
-      Node* t = nullptr;
-
-      // must use 1 as condition instead of !done
-      while(1) {
-        
-        // execute the tasks.
-        _exploit_task(w, t);
-
-        // wait for tasks
-        if(_wait_for_task(w, t) == false) {
-          break;
-        }
-      }
-      
-    }, std::ref(_workers[id]));     
-  }
+    size_t id = _workers.size();
+    size_t notifID = _notifier._waiters.size();
+    _MAX_STEALS = (_workers.size() + 1) << 1;
+    std::shared_ptr<Notifier::Waiter> waiter = std::make_shared<Notifier::Waiter>();
+    _notifier._waiters.push_back(waiter);
+    std::shared_ptr<Worker> w = std::make_shared<Worker>();
+    w->_id = id;
+    w->_vtm = id;
+    w->_scheduler = this;
+    w->_waiter = _notifier._waiters[notifID];
+    w->_thread = thread;
+    _workers.push_back(std::move(w));
+    return _workers.back();
 }
 
 // Function: _explore_task
 inline void TaskScheduler::_explore_task(Worker& w, Node*& t) {
   
-  //assert(_workers[w].wsq.empty());
   assert(!t);
 
   size_t num_steals = 0;
   size_t num_yields = 0;
 
-  std::uniform_int_distribution<size_t> rdvtm(_VICTIM_BEG, _VICTIM_END);
-
-  //while(!_done) {
-  //
-  //  size_t vtm = rdvtm(w._rdgen);
-  //    
-  //  t = (vtm == w._id) ? _wsq[d].steal() : _workers[vtm].wsq[d].steal();
-
-  //  if(t) {
-  //    break;
-  //  }
-
-  //  if(num_steal++ > _MAX_STEALS) {
-  //    std::this_thread::yield();
-  //    if(num_yields++ > _MAX_YIELDS) {
-  //      break;
-  //    }
-  //  }
-  //}
+  std::uniform_int_distribution<size_t> rdvtm(0, _workers.size() - 1);
 
   do {
-    t = (w._id == w._vtm) ? _wsq.steal() : _workers[w._vtm]._wsq.steal();
+    t = (w._id == w._vtm) ? _wsq.steal() : _workers[w._vtm]->_wsq.steal();
 
     if(t) {
       break;
@@ -484,12 +459,12 @@ inline bool TaskScheduler::_wait_for_task(Worker& worker, Node*& t) {
     return true;
   }
 
-  _notifier.prepare_wait(worker._waiter);
+  _notifier.prepare_wait(worker._waiter.get());
   
   //if(auto vtm = _find_vtm(me); vtm != _workers.size()) {
   if(!_wsq.empty()) {
 
-    _notifier.cancel_wait(worker._waiter);
+    _notifier.cancel_wait(worker._waiter.get());
     //t = (vtm == me) ? _wsq.steal() : _workers[vtm].wsq.steal();
     
     t = _wsq.steal();  // must steal here
@@ -506,7 +481,7 @@ inline bool TaskScheduler::_wait_for_task(Worker& worker, Node*& t) {
   }
 
   if(_done) {
-    _notifier.cancel_wait(worker._waiter);
+    _notifier.cancel_wait(worker._waiter.get());
     _notifier.notify(true);
     --_num_thieves;
     return false;
@@ -514,21 +489,21 @@ inline bool TaskScheduler::_wait_for_task(Worker& worker, Node*& t) {
 
   if(_num_thieves.fetch_sub(1) == 1) {
     if(_num_actives) {
-      _notifier.cancel_wait(worker._waiter);
+      _notifier.cancel_wait(worker._waiter.get());
       goto wait_for_task;
     }
     // check all queues again
     for(auto& w : _workers) {
-      if(!w._wsq.empty()) {
-        worker._vtm = w._id;
-        _notifier.cancel_wait(worker._waiter);
+      if(!w->_wsq.empty()) {
+        worker._vtm = w->_id;
+        _notifier.cancel_wait(worker._waiter.get());
         goto wait_for_task;
       }
     }
   }
     
   // Now I really need to relinguish my self to others
-  _notifier.commit_wait(worker._waiter);
+  _notifier.commit_wait(worker._waiter.get());
 
   return true;
 }
@@ -903,7 +878,7 @@ inline void TaskScheduler::_invoke_dynamic_task_internal(
     _schedule(src);
     Node* t = nullptr;
   
-    std::uniform_int_distribution<size_t> rdvtm(_VICTIM_BEG, _VICTIM_END);
+    std::uniform_int_distribution<size_t> rdvtm(0, _workers.size() - 1);
 
     while(p->_join_counter != 0) {
 
@@ -916,7 +891,7 @@ inline void TaskScheduler::_invoke_dynamic_task_internal(
       }
       else {
         explore:
-        t = (w._id == w._vtm) ? _wsq.steal() : _workers[w._vtm]._wsq.steal();
+        t = (w._id == w._vtm) ? _wsq.steal() : _workers[w._vtm]->_wsq.steal();
         if(t) {
           goto exploit;
         }

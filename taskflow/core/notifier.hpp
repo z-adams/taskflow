@@ -81,7 +81,7 @@ class Notifier {
     };
   };
 
-  explicit Notifier(size_t N) : _waiters{N} {
+  explicit Notifier(size_t N) : _waiters{} {
     assert(_waiters.size() < (1 << kWaiterBits) - 1);
     // Initialize epoch to something close to overflow to test overflow.
     _state = kStackMask | (kEpochMask - kEpochInc * _waiters.size() * 2);
@@ -122,11 +122,11 @@ class Notifier {
       assert((state & kWaiterMask) != 0);
       uint64_t newstate = state - kWaiterInc + kEpochInc;
       //newstate = (newstate & ~kStackMask) | (w - &_waiters[0]);
-      newstate = static_cast<uint64_t>((newstate & ~kStackMask) | static_cast<uint64_t>(w - &_waiters[0]));
+      newstate = static_cast<uint64_t>((newstate & ~kStackMask) | static_cast<uint64_t>(w - _waiters[0].get()));
       if ((state & kStackMask) == kStackMask)
         w->next.store(nullptr, std::memory_order_relaxed);
       else
-        w->next.store(&_waiters[state & kStackMask], std::memory_order_relaxed);
+        w->next.store(_waiters[state & kStackMask].get(), std::memory_order_relaxed);
       if (_state.compare_exchange_weak(state, newstate,
                                        std::memory_order_release))
         break;
@@ -177,11 +177,11 @@ class Notifier {
         newstate = state + kEpochInc - kWaiterInc;
       } else {
         // Pop a waiter from list and unpark it.
-        Waiter* w = &_waiters[state & kStackMask];
+        Waiter* w = _waiters[state & kStackMask].get();
         Waiter* wnext = w->next.load(std::memory_order_relaxed);
         uint64_t next = kStackMask;
         //if (wnext != nullptr) next = wnext - &_waiters[0];
-        if (wnext != nullptr) next = static_cast<uint64_t>(wnext - &_waiters[0]);
+        if (wnext != nullptr) next = static_cast<uint64_t>(wnext - _waiters[0].get());
         // Note: we don't add kEpochInc here. ABA problem on the lock-free stack
         // can't happen because a waiter is re-pushed onto the stack only after
         // it was in the pre-wait state which inevitably leads to epoch
@@ -192,7 +192,7 @@ class Notifier {
                                        std::memory_order_acquire)) {
         if (!all && waiters) return;  // unblocked pre-wait thread
         if ((state & kStackMask) == kStackMask) return;
-        Waiter* w = &_waiters[state & kStackMask];
+        Waiter* w = _waiters[state & kStackMask].get();
         if (!all) w->next.store(nullptr, std::memory_order_relaxed);
         _unpark(w);
         return;
@@ -234,7 +234,7 @@ class Notifier {
   static const uint64_t kEpochMask = ((1ull << kEpochBits) - 1) << kEpochShift;
   static const uint64_t kEpochInc = 1ull << kEpochShift;
   std::atomic<uint64_t> _state;
-  std::vector<Waiter> _waiters;
+  std::vector<std::shared_ptr<Waiter>> _waiters;
 
   void _park(Waiter* w) {
     std::unique_lock<std::mutex> lock(w->mu);

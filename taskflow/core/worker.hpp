@@ -19,14 +19,24 @@ class Worker {
   friend class TaskScheduler;
   friend class WorkerView;
 
+  /*Worker(size_t id, size_t victim, TaskScheduler* scheduler, Notifier::Waiter* waiter)
+      : _id(id), _vtm(victim), _scheduler(scheduler), _waiter(waiter)
+  {}
+
+  Worker() : Worker(0, 0, nullptr, nullptr) {}
+
+  Worker(Worker&& move) : _id(std::exchange(move._id, 0)), _vtm(std::exchange(move._vtm, 0)), _scheduler(std::exchange(move._scheduler, nullptr)), _waiter(std::exchange(move._waiter, nullptr)), _rdgen(std::move(move._rdgen)), _wsq(std::move(move._wsq))
+  {}*/
+
   private:
 
     size_t _id;
     size_t _vtm;
     TaskScheduler* _scheduler;
-    Notifier::Waiter* _waiter;
+    std::shared_ptr<Notifier::Waiter> _waiter;
     std::default_random_engine _rdgen { std::random_device{}() };
     TaskQueue<Node*> _wsq;
+    std::thread* _thread;
 };
 
 // ----------------------------------------------------------------------------
